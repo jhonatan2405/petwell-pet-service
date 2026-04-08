@@ -1,0 +1,507 @@
+=========================================================
+  PetWell — Pet Service | Documento de ContextIA
+  Última actualización: 2026-04-07 (v7.0)
+=========================================================
+
+Este documento resume el estado completo del microservicio
+Pet Service dentro de la plataforma PetWell.
+Está pensado para dar contexto a una IA asistente o a un nuevo
+desarrollador que ingrese al proyecto.
+
+─────────────────────────────────────────────────────────
+1. ¿QUÉ ES ESTE SERVICIO?
+─────────────────────────────────────────────────────────
+El Pet Service es responsable de gestionar los perfiles de
+las mascotas registradas por los dueños en la plataforma
+PetWell. Almacena únicamente datos básicos de la mascota.
+
+Los datos médicos (historial clínico, vacunas, etc.) son
+responsabilidad del EHR Service (microservicio separado).
+
+Relación con User Service:
+  - Los dueños (owners) son usuarios registrados en el
+    User Service.
+  - Una mascota puede tener UNO O VARIOS dueños (many-to-many).
+  - El owner_id se obtiene SIEMPRE del JWT — nunca del body.
+  - La relación se almacena en la tabla pet_owners.
+  - Ambos servicios comparten el mismo JWT_SECRET para
+    validar tokens.
+
+─────────────────────────────────────────────────────────
+2. TECNOLOGÍAS UTILIZADAS
+─────────────────────────────────────────────────────────
+- Runtime     : Node.js (>=18)
+- Lenguaje    : TypeScript
+- Framework   : Express
+- Base de datos: Supabase (PostgreSQL)
+- Auth        : JWT (jsonwebtoken) — solo verificación
+- Validación  : express-validator
+- Seguridad   : helmet, cors
+- Logging     : morgan
+- Upload      : multer (memory storage) + Supabase Storage
+
+─────────────────────────────────────────────────────────
+3. ARQUITECTURA DEL PROYECTO
+─────────────────────────────────────────────────────────
+src/
+├── config/
+│   ├── env.ts             ← Variables de entorno tipadas
+│   └── supabase.ts        ← Cliente Supabase (service role)
+├── controllers/
+│   └── pet.controller.ts  ← createPet, getMyPets, getPetById,
+│                             updatePet, deletePet
+├── middlewares/
+│   ├── auth.middleware.ts    ← authenticate (JWT verification)
+│   ├── validate.middleware.ts← express-validator handler
+│   └── error.middleware.ts   ← Global error handler
+├── models/
+│   └── pet.model.ts          ← PetRow, PetOwnerRow, CreatePetDto,
+│                                UpdatePetDto, PetPublicProfile,
+│                                JwtPayload
+├── repositories/
+│   ├── pet.repository.ts     ← CRUD Supabase + isOwner + addOwner +
+│   │                            toPetPublicProfile
+│   └── user.repository.ts    ← findByEmail (tabla users de User Service)
+├── routes/
+│   ├── pet.routes.ts         ← GET|POST /pets, GET|PUT|DELETE /pets/:id,
+│   │                            POST /pets/:id/owners
+│   └── index.ts              ← Router principal + health check
+├── services/
+│   └── pet.service.ts        ← Lógica de negocio + validación de ownership
+│                                + addOwner
+├── utils/
+│   ├── jwt.util.ts           ← verifyToken (solo verificación)
+│   └── response.util.ts      ← sendSuccess, sendError
+└── server.ts                 ← Bootstrap Express
+
+database/
+└── schema.sql                ← Script SQL completo para Supabase
+
+Patrón: Controller → Service → Repository
+No hay lógica de negocio en controllers.
+No hay llamadas a Supabase en services.
+
+─────────────────────────────────────────────────────────
+4. BASE DE DATOS (Supabase / PostgreSQL)
+─────────────────────────────────────────────────────────
+Tabla: pets
+
+  id                UUID PRIMARY KEY DEFAULT uuid_generate_v4()
+  name              VARCHAR(100) NOT NULL
+  species           VARCHAR(50)  NOT NULL
+  breed             VARCHAR(100)
+  birth_date        DATE
+  sex               VARCHAR(10)
+  weight            DECIMAL(5,2)
+  microchip         VARCHAR(100)
+  allergies         TEXT
+  primary_clinic_id UUID                   ← ref a clinics (User Service)
+  photo_url         TEXT                   ← URL pública de Supabase Storage (pet-photos bucket)
+  created_at        TIMESTAMPTZ DEFAULT NOW()
+  updated_at        TIMESTAMPTZ DEFAULT NOW() (auto-update trigger)
+
+  NOTA: owner_id eliminado en v2. La propiedad de la mascota
+  se gestiona exclusivamente en la tabla pet_owners.
+
+  MIGRACIÓN: ejecutar database/migration_photo_url.sql para
+  añadir la columna photo_url a una BD existente:
+    ALTER TABLE pets ADD COLUMN IF NOT EXISTS photo_url TEXT;
+
+Tabla: pet_owners  (relación many-to-many)
+
+  pet_id   UUID REFERENCES pets(id) ON DELETE CASCADE
+  owner_id UUID NOT NULL
+  PRIMARY KEY (pet_id, owner_id)
+
+  Un registro por cada dueño de cada mascota.
+  owner_id referencia al user_id gestionado por el User Service.
+  ON DELETE CASCADE elimina las filas automáticamente al borrar la mascota.
+
+Índices:
+  idx_pet_owners_owner_id  ON pet_owners(owner_id)  ← GET /pets
+  idx_pet_owners_pet_id    ON pet_owners(pet_id)    ← isOwner(), joins
+  idx_pets_primary_clinic  ON pets(primary_clinic_id) ← consultas futuras
+
+Trigger: trg_pets_updated_at → actualiza updated_at automáticamente.
+
+─────────────────────────────────────────────────────────
+5. ENDPOINTS DISPONIBLES
+─────────────────────────────────────────────────────────
+BASE URL: http://localhost:<PORT>/api/v1
+Todas las rutas requieren: Authorization: Bearer <token>
+
+── Health ───────────────────────────────────────────────
+
+GET /api/v1/health
+  → { status: "ok", service: "pet-service", timestamp }
+
+── Mascotas (requieren Bearer Token) ────────────────────
+
+POST /api/v1/pets
+  Registra una nueva mascota.
+  owner_id se extrae del JWT automáticamente.
+  Crea un registro en pets Y un registro en pet_owners
+  con (pet_id, owner_id = token.sub).
+  Body:
+    {
+      name*,       ← requerido
+      species*,    ← requerido
+      breed?,
+      birth_date?, ← formato ISO 8601 (YYYY-MM-DD)
+      sex?,        ← "macho" | "hembra" | "male" | "female"
+      weight?,     ← número positivo
+      microchip?,
+      allergies?,
+      primary_clinic_id?  ← UUID válido
+    }
+  Responde: 201 + { success, message, data: PetPublicProfile }
+
+GET /api/v1/pets
+  Lista todas las mascotas del usuario autenticado.
+  Realiza un JOIN entre pets y pet_owners filtrando por
+  pet_owners.owner_id = token.sub.
+  Responde: 200 + { success, message, data: PetPublicProfile[] }
+
+GET /api/v1/pets/:id
+  Obtiene una mascota por ID.
+  Solo accesible si token.sub aparece en pet_owners para esa mascota
+  (403 en caso contrario).
+  Responde: 200 + { success, message, data: PetPublicProfile }
+
+PUT /api/v1/pets/:id
+  Actualiza datos de una mascota.
+  Solo accesible si token.sub es uno de los dueños (pet_owners).
+  Body: cualquier subconjunto de los campos de CreatePetDto.
+  Responde: 200 + { success, message, data: PetPublicProfile }
+
+DELETE /api/v1/pets/:id
+  Elimina una mascota.
+  Solo accesible si token.sub es uno de los dueños.
+  ON DELETE CASCADE elimina pet_owners automáticamente.
+  Responde: 200 + { success: true, message: "Mascota eliminada correctamente" }
+
+POST /api/v1/pets/:id/owners
+  Vincula un nuevo dueño a una mascota existente.
+  Solo un dueño actual puede ejecutar esta acción.
+  El nuevo dueño se identifica por su email.
+  Body: { "email": "usuario@email.com" }
+  Flujo:
+    1. Verifica JWT (authenticate)
+    2. Verifica que el solicitante (token.sub) es dueño de la mascota
+    3. Busca el usuario por email en la tabla users (User Service)
+    4. Verifica que el usuario no sea ya dueño (evita duplicados)
+    5. Inserta en pet_owners (pet_id, user.id)
+  Responde: 200 + { success: true, message: "Nuevo dueño vinculado a la mascota" }
+  Errores:
+    400 → El usuario ya es dueño de esta mascota
+    403 → El solicitante no es dueño de la mascota
+    404 → Mascota no encontrada | Usuario no encontrado
+
+GET /api/v1/pets/:id/owners
+  Devuelve la lista de dueños de una mascota.
+  Solo accesible si token.sub es uno de los dueños.
+  Flujo interno:
+    1. Obtiene owner_ids desde pet_owners (Supabase)
+    2. Para cada owner_id llama en paralelo a:
+       GET {USER_SERVICE_URL}/api/v1/users/:id
+       con el mismo Bearer token del solicitante
+    3. Devuelve la unión de datos
+  Responde: 200 + { success: true, data: { owners: [{ id, name, email }] } }
+  Errores:
+    403 → El solicitante no es dueño de la mascota
+    404 → Mascota no encontrada
+
+DELETE /api/v1/pets/:petId/owners/:ownerId
+  Elimina a un dueño de la mascota.
+  Solo un dueño actual puede ejecutar esta acción.
+  No se puede eliminar al último dueño.
+  Responde: 200 + { success: true, message: "Dueño eliminado correctamente" }
+  Errores:
+    400 → No se puede eliminar al último dueño
+    403 → El solicitante no es dueño de la mascota
+    404 → Mascota no encontrada
+
+POST /api/v1/pets/:id/photo
+  Sube una imagen para la mascota y guarda la URL pública en la BD.
+  Solo el dueño de la mascota puede subir una foto.
+  Recibe: multipart/form-data con campo "photo" (imagen, máx 5 MB).
+  Almacenamiento: Supabase Storage bucket "pet-photos".
+  Ruta del objeto: {petId}/photo.{ext}
+  Comportamiento: si ya existe una foto la sobreescribe (upsert: true).
+  Responde: 200 + { success: true, data: { photo_url: "https://..." } }
+  Errores:
+    400 → No se proporcionó archivo
+    403 → El solicitante no es dueño de la mascota
+    404 → Mascota no encontrada
+
+  REQUERIMIENTO SUPABASE:
+    Crear el bucket "pet-photos" con acceso pública habilitado
+    para que getPublicUrl() devuelva una URL directa de CDN.
+
+─────────────────────────────────────────────────────────
+6. SEGURIDAD Y OWNERSHIP
+─────────────────────────────────────────────────────────
+- Todas las rutas requieren un JWT válido (middleware authenticate).
+- owner_id NUNCA se recibe del cuerpo de la petición.
+  Siempre se obtiene de token.sub.
+- En GET /pets/:id, PUT /pets/:id y DELETE /pets/:id el servicio
+  verifica que exista una fila en pet_owners con
+  (pet_id = :id AND owner_id = token.sub) antes de proceder.
+  → 403 si el usuario no es dueño, 404 si la mascota no existe.
+- La verificación se realiza con petRepository.isOwner(petId, ownerId)
+  que hace una consulta puntual a pet_owners usando el índice
+  idx_pet_owners_pet_id.
+
+─────────────────────────────────────────────────────────
+6b. COMUNICACIÓN ENTRE MICROSERVICIOS
+─────────────────────────────────────────────────────────
+Pet Service NO accede a la tabla `users` de Supabase directamente.
+Hacerlo rompería la arquitectura de microservicios.
+
+El único caso donde se necesita información del User Service es
+GET /pets/:id/owners. El flujo es:
+
+  Pet Service
+    → SELECT owner_id FROM pet_owners WHERE pet_id = :id
+    → Para cada owner_id:
+         GET {USER_SERVICE_URL}/api/v1/users/:owner_id
+         (Authorization: Bearer <token-del-solicitante>)
+    → Devuelve [{ id, name, email }]
+
+El Bearer token del solicitante se reenvía directamente al User Service,
+evitando la necesidad de un token de servicio dedicado.
+
+Si el User Service no responde o devuelve error para un usuario concreto,
+la degradación es elegante: se devuelve { id, name: 'Desconocido', email: 'N/A' }
+sin abortar toda la lista.
+
+─────────────────────────────────────────────────────────
+7. JWT PAYLOAD (emitido por User Service)
+─────────────────────────────────────────────────────────
+{
+  "sub":       "<user_id>",     ← se usa como owner_id en pet_owners
+  "email":     "<email>",
+  "role":      "<role_name>",
+  "clinic_id": "<clinic_id> | null",
+  "iat":       <timestamp>,
+  "exp":       <timestamp>
+}
+
+─────────────────────────────────────────────────────────
+8. FORMATO DE RESPUESTA
+─────────────────────────────────────────────────────────
+Todas las respuestas siguen el formato estándar del sistema:
+
+  {
+    "success": true | false,
+    "message": "Mensaje descriptivo",
+    "data":    { ... }   // null en errores sin datos
+  }
+
+PetPublicProfile (shape en data):
+  {
+    id, owner_ids (string[]), name, species, breed,
+    birth_date, sex, weight, microchip, allergies,
+    primary_clinic_id, photo_url, created_at, updated_at
+  }
+
+Errores comunes:
+  401 → Token ausente, inválido o expirado
+  403 → El usuario no es dueño de la mascota
+  404 → Mascota no encontrada
+  422 → Error de validación (body inválido)
+  500 → Error interno del servidor
+
+─────────────────────────────────────────────────────────
+9. VARIABLES DE ENTORNO
+─────────────────────────────────────────────────────────
+PORT=3002
+NODE_ENV=development
+JWT_SECRET=            ← debe coincidir con User Service
+SUPABASE_URL=
+SUPABASE_SERVICE_ROLE_KEY=
+ALLOWED_ORIGINS=http://localhost:3000
+
+─────────────────────────────────────────────────────────
+10. CÓMO EJECUTAR EL SERVICIO
+─────────────────────────────────────────────────────────
+1. Instalar dependencias:
+     npm install
+
+2. Configurar variables de entorno:
+     Copia .env.example → .env y completa los valores.
+     Asegúrate de que JWT_SECRET coincida con User Service.
+
+3. Crear la base de datos:
+     Ejecuta database/schema.sql en el SQL Editor de Supabase.
+     (Si ya existía una BD con datos, ver sección 11 — Migración)
+
+4. Iniciar en modo desarrollo:
+     npm run dev
+
+5. Verificar TypeScript:
+     npx tsc --noEmit
+
+─────────────────────────────────────────────────────────
+11. MIGRACIÓN DESDE v1 (owner_id → pet_owners)
+─────────────────────────────────────────────────────────
+El script de migración está en:
+
+  database/migration_v2.sql
+
+Pasos:
+  1. Asegúrate de que schema.sql (v1) ya esté aplicado en Supabase.
+  2. Ejecuta migration_v2.sql en el SQL Editor de Supabase.
+     El script:
+       a) Crea la tabla pet_owners
+       b) Migra los owner_id existentes a pet_owners (INSERT...SELECT)
+       c) Crea los índices idx_pet_owners_owner_id e idx_pet_owners_pet_id
+       d) Elimina la columna owner_id de pets y su índice antiguo
+
+  ⚠ Para una base de datos vacía (desarrollo), schema.sql +
+    migration_v2.sql se pueden ejecutar juntos secuencialmente.
+    El INSERT...SELECT simplemente no insertará filas.
+
+─────────────────────────────────────────────────────────
+12. API GATEWAY
+─────────────────────────────────────────────────────────
+El Pet Service se expone al frontend a través del API Gateway
+(microservicio separado en Node.js + Express).
+
+El frontend NO debe llamar al Pet Service directamente.
+Todas las peticiones pasan por el gateway:
+
+  Frontend  →  API Gateway (:3001)  →  Pet Service (:3002)
+
+Rutas expuestas por el Gateway para este servicio:
+  /api/v1/pets       → proxy a http://localhost:3002/api/v1/pets
+  /api/v1/pets/:id   → proxy a http://localhost:3002/api/v1/pets/:id
+
+El gateway implementa:
+  - http-proxy-middleware para redirección de peticiones
+  - Responde 502 con { success: false, message: "Pet Service no disponible" }
+    si el Pet Service no está levantado
+  - Health check propio: GET http://localhost:3001/health
+
+Variables de entorno del Gateway:
+  PORT=3001
+  PET_SERVICE_URL=http://localhost:3002
+  USER_SERVICE_URL=http://localhost:3003
+
+Ubicación del proyecto gateway:
+  petwell/api-gateway/
+  ├── src/
+  │   ├── server.js              ← Bootstrap Express + rutas
+  │   └── routes/
+  │       ├── pet.routes.js      ← Proxy hacia Pet Service
+  │       └── user.routes.js     ← Proxy hacia User Service
+  └── .env
+
+─────────────────────────────────────────────────────────
+13. PRÓXIMOS PASOS SUGERIDOS
+─────────────────────────────────────────────────────────
+- EHR Service: historial médico, vacunas, consultas por pet_id
+- Endpoint GET /pets por clínica (usando idx_pets_primary_clinic)
+- Permitir a veterinarios (rol VETERINARIO) consultar mascotas
+  de sus clínicas asociadas
+- Agregar paginación en GET /pets para dueños con muchas mascotas
+- Agregar tests unitarios e integración
+
+─────────────────────────────────────────────────────────
+CHANGELOG
+─────────────────────────────────────────────────────────
+v7.0 — 2026-04-07
+  * Foto de mascota (photo_url)
+  * Nuevo campo: pets.photo_url (TEXT)
+  * Nuevo endpoint: POST /api/v1/pets/:id/photo
+    → multer memory storage + Supabase Storage bucket "pet-photos"
+    → upsert: sobreescribe foto existente
+    → Solo el dueño puede subir/cambiar la foto
+  * petRepository: uploadPhoto() + updatePhotoUrl()
+  * petService: uploadPhoto() con validación de ownership
+  * petController: uploadPhoto() handler
+  * pet.routes.ts: ruta POST /:id/photo con upload.single('photo')
+  * pet.model.ts: photo_url añadido a PetRow, PetPublicProfile, UpdatePetDto
+  * toPetPublicProfile: incluye photo_url
+  * Nueva dependencia: multer + @types/multer
+  * Migration: database/migration_photo_url.sql
+
+v6.4 — 2026-03-22
+  * Nuevo endpoint: GET /api/v1/pets/clinic
+    → Obtiene las mascotas de la clínica a la que pertenece el usuario.
+    → Accesible solo por CLINIC_ADMIN, VETERINARIO, RECEPCIONISTA.
+    → Middleware `authorize` introducido.
+
+v6.3 — Reenvío correcto del JWT entre microservicios
+  * Se corrigió la comunicación entre Pet Service y User Service
+  * para reenviar el token JWT del cliente sin dividirlo, 
+  * permitiendo resolver correctamente los datos de los dueños de mascotas.
+v6.2 — 2026-03-15
+  * Corrección de resolución de usuarios.
+  * Se corrigió la lógica de getOwners() para procesar correctamente
+  * la respuesta del User Service y mostrar nombre y email de los dueños.
+
+v6.1 — 2026-03-15
+  * Eliminación completa de acceso a tabla users.
+  * Se eliminó cualquier consulta directa a la tabla users desde Pet Service.
+  * Ahora toda la información de usuarios se obtiene mediante llamadas HTTP
+  * al User Service.
+
+v6 — 2026-03-15
+  * getOwners() refactorizado para llamar al User Service vía HTTP.
+    Pet Service ya no accede a la tabla users de Supabase directamente.
+  * petRepository.getOwners(): devuelve string[] (solo owner_ids).
+  * petService.getOwners(): llama en paralelo a
+    GET {USER_SERVICE_URL}/api/v1/users/:id con Promise.all().
+    Degradación elegante si un usuario no responde.
+  * petController.getOwners(): extrae y reenvía el Bearer token.
+  * env.ts: nueva propiedad userServiceUrl.
+  * .env / .env.example: nueva variable USER_SERVICE_URL.
+  * Sección 6b (comunicación entre microservicios) añadida.
+  * contextIA.txt actualizado a v6.
+
+v5 — 2026-03-15
+  * Gestión completa de dueños de mascotas.
+  * Nuevo endpoint: GET /api/v1/pets/:id/owners
+    → Lista los dueños (id, name, email) de una mascota.
+  * Nuevo endpoint: DELETE /api/v1/pets/:petId/owners/:ownerId
+    → Elimina un dueño. Impide eliminar al último.
+  * petRepository: nuevos métodos getOwners() y removeOwner().
+  * petService: nuevos métodos getOwners() y removeOwner()
+    con validación de permisos y regla del último dueño.
+  * petController: nuevos métodos getOwners y removeOwner.
+  * pet.routes.ts: nuevas rutas GET /:id/owners y
+    DELETE /:petId/owners/:ownerId.
+  * contextIA.txt actualizado a v5.
+
+v4 — 2026-03-15
+  * Nuevo endpoint: POST /api/v1/pets/:id/owners
+    → Permite a un dueño existente vincular otro dueño por email.
+  * Nuevo archivo: src/repositories/user.repository.ts
+    → findByEmail() consulta la tabla users del User Service.
+  * petRepository: nuevo método addOwner(petId, ownerId).
+  * petService: nuevo método addOwner(petId, requesterId, email)
+    con validación de existencia, permisos y duplicados.
+  * petController: nuevo método addOwner.
+  * pet.routes.ts: nueva ruta POST /:id/owners con validación de email.
+  * contextIA.txt actualizado a v4.
+
+v3 — 2026-03-16
+  * Añadida sección 12: API Gateway (puerto 3001).
+  * Documentada arquitectura de proxy: Frontend → Gateway → Pet Service.
+  * contextIA.txt actualizado a v3.
+
+v2 — 2026-03-15
+  * Eliminado owner_id de la tabla pets.
+  * Creada tabla pet_owners (pet_id, owner_id) — many-to-many.
+  * Añadidos índices idx_pet_owners_owner_id e idx_pet_owners_pet_id.
+  * PetPublicProfile: owner_id → owner_ids (string[]).
+  * petRepository: nuevo método isOwner(), create() ahora inserta
+    en pet_owners, findAllByOwner() usa JOIN vía pet_owners,
+    toPetPublicProfile() recibe ownerIds como segundo argumento.
+  * petService: checks de ownership usan petRepository.isOwner().
+  * contextIA.txt actualizado a v2.
+
+v1 — 2026-03-15
+  * Implementación inicial del Pet Service.
+=========================================================
